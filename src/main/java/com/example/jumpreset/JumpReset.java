@@ -29,7 +29,7 @@ public class JumpReset {
 
     // true while our packet listener is attached to the current connection
     private volatile boolean hooked = false;
-    // set on the main thread right after the knockback packet has been applied
+    // set on the main thread right after a knockback packet has been applied
     private boolean velocityApplied = false;
     // used only by the fallback path
     private int lastHurtTime = 0;
@@ -55,8 +55,6 @@ public class JumpReset {
         }
     }
 
-    // Attach a read-only listener to the connection so we know exactly when
-    // the knockback packet for the local player arrives.
     @SubscribeEvent
     public void onConnect(FMLNetworkEvent.ClientConnectedToServerEvent e) {
         try {
@@ -78,14 +76,15 @@ public class JumpReset {
     private class VelocityHook extends ChannelInboundHandlerAdapter {
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-            // Pass the packet on first: this queues the game's own handling of it.
             ctx.fireChannelRead(msg);
             try {
                 if (msg instanceof S12PacketEntityVelocity) {
+                    S12PacketEntityVelocity v = (S12PacketEntityVelocity) msg;
                     EntityPlayerSP p = mc.thePlayer;
-                    if (p != null && ((S12PacketEntityVelocity) msg).getEntityID() == p.getEntityId()) {
-                        // Queued after the game's own task for this packet, so it runs
-                        // right after the knockback has been applied.
+                    // Only knockback aimed at us that actually pushes sideways.
+                    if (p != null
+                            && v.getEntityID() == p.getEntityId()
+                            && (v.getMotionX() != 0 || v.getMotionZ() != 0)) {
                         mc.addScheduledTask(new Runnable() {
                             @Override
                             public void run() {
@@ -108,7 +107,7 @@ public class JumpReset {
         if (hooked) {
             if (velocityApplied) {
                 velocityApplied = false;
-                fire = p.hurtTime > 0; // only real hits, not launch pads etc.
+                fire = p.hurtTime > 0;
             }
             lastHurtTime = p.hurtTime;
         } else {
@@ -118,6 +117,7 @@ public class JumpReset {
         }
 
         if (!enabled || !fire) return;
+        if (p.isBurning()) return; // no jump resets while on fire
         if (canJump(p)) {
             p.jump();
         }
