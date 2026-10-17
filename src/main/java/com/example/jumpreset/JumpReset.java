@@ -1,8 +1,11 @@
 package com.example.jumpreset;
 
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
 import net.minecraft.util.ChatComponentText;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.entity.living.LivingEvent;
@@ -11,35 +14,30 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.InputEvent;
+import net.minecraftforge.fml.common.network.FMLNetworkEvent;
 import org.lwjgl.input.Keyboard;
 
 @Mod(modid = JumpReset.MODID, name = "JumpReset", version = "1.0", clientSideOnly = true)
 public class JumpReset {
     public static final String MODID = "jumpreset";
-
-    private static final int MIN_DELAY = 0;
-    private static final int MAX_DELAY = 2;
+    private static final String HOOK_NAME = "jumpreset_hook";
 
     private final Minecraft mc = Minecraft.getMinecraft();
     private KeyBinding toggleKey;
-    private KeyBinding delayUpKey;
-    private KeyBinding delayDownKey;
 
     private boolean enabled = true;
-    private int delayTicks = 1; // 1 tick = 50 ms
 
-    private boolean pending = false;
-    private int delayLeft = 0;
+    // true while our packet listener is attached to the current connection
+    private volatile boolean hooked = false;
+    // set on the main thread right after the knockback packet has been applied
+    private boolean velocityApplied = false;
+    // used only by the fallback path
     private int lastHurtTime = 0;
 
     @Mod.EventHandler
     public void init(FMLInitializationEvent event) {
         toggleKey = new KeyBinding("Toggle Jump Reset", Keyboard.KEY_J, "JumpReset");
-        delayUpKey = new KeyBinding("Delay +", Keyboard.KEY_RBRACKET, "JumpReset");
-        delayDownKey = new KeyBinding("Delay -", Keyboard.KEY_LBRACKET, "JumpReset");
         ClientRegistry.registerKeyBinding(toggleKey);
-        ClientRegistry.registerKeyBinding(delayUpKey);
-        ClientRegistry.registerKeyBinding(delayDownKey);
         MinecraftForge.EVENT_BUS.register(this);
     }
 
@@ -55,41 +53,77 @@ public class JumpReset {
             enabled = !enabled;
             say(enabled ? "\u00a7aON" : "\u00a7cOFF");
         }
-        if (delayUpKey.isPressed()) {
-            if (delayTicks < MAX_DELAY) delayTicks++;
-            say("\u00a7fDelay: \u00a7b" + delayTicks + " tick(s) \u00a77(" + (delayTicks * 50) + " ms)");
+    }
+
+    // Attach a read-only listener to the connection so we know exactly when
+    // the knockback packet for the local player arrives.
+    @SubscribeEvent
+    public void onConnect(FMLNetworkEvent.ClientConnectedToServerEvent e) {
+        try {
+            if (e.manager.channel().pipeline().get(HOOK_NAME) == null) {
+                e.manager.channel().pipeline().addBefore("packet_handler", HOOK_NAME, new VelocityHook());
+            }
+            hooked = true;
+        } catch (Throwable t) {
+            hooked = false;
         }
-        if (delayDownKey.isPressed()) {
-            if (delayTicks > MIN_DELAY) delayTicks--;
-            say("\u00a7fDelay: \u00a7b" + delayTicks + " tick(s) \u00a77(" + (delayTicks * 50) + " ms)");
+    }
+
+    @SubscribeEvent
+    public void onDisconnect(FMLNetworkEvent.ClientDisconnectionFromServerEvent e) {
+        hooked = false;
+        velocityApplied = false;
+    }
+
+    private class VelocityHook extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            // Pass the packet on first: this queues the game's own handling of it.
+            ctx.fireChannelRead(msg);
+            try {
+                if (msg instanceof S12PacketEntityVelocity) {
+                    EntityPlayerSP p = mc.thePlayer;
+                    if (p != null && ((S12PacketEntityVelocity) msg).getEntityID() == p.getEntityId()) {
+                        // Queued after the game's own task for this packet, so it runs
+                        // right after the knockback has been applied.
+                        mc.addScheduledTask(new Runnable() {
+                            @Override
+                            public void run() {
+                                velocityApplied = true;
+                            }
+                        });
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
         }
     }
 
     @SubscribeEvent
     public void onLivingUpdate(LivingEvent.LivingUpdateEvent e) {
-        if (!enabled) return;
         if (!(e.entity instanceof EntityPlayerSP)) return;
-
         EntityPlayerSP p = (EntityPlayerSP) e.entity;
-        int hurt = p.hurtTime;
 
-        // Fresh hit: only arm the jump if you were standing on the ground when it landed.
-        if (hurt > lastHurtTime) {
-            pending = canJump(p);
-            delayLeft = delayTicks;
+        boolean fire = false;
+        if (hooked) {
+            if (velocityApplied) {
+                velocityApplied = false;
+                fire = p.hurtTime > 0; // only real hits, not launch pads etc.
+            }
+            lastHurtTime = p.hurtTime;
+        } else {
+            int hurt = p.hurtTime;
+            if (hurt > lastHurtTime) fire = true;
+            lastHurtTime = hurt;
         }
-        lastHurtTime = hurt;
 
-        if (!pending) return;
-        if (hurt == 0) { pending = false; return; }
-        if (delayLeft > 0) { delayLeft--; return; }
-
-        pending = false;
-        if (!p.isInWater() && !p.isInLava() && !p.isOnLadder()) {
+        if (!enabled || !fire) return;
+        if (canJump(p)) {
             p.jump();
         }
     }
 
+    // Ground only: no jumping while airborne.
     private boolean canJump(EntityPlayerSP p) {
         return p.onGround
                 && !p.isInWater()
