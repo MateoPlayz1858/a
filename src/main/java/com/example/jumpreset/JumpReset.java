@@ -20,6 +20,9 @@ public class JumpReset {
     private static final int MIN_DELAY = 0; // ticks
     private static final int MAX_DELAY = 8; // 8 ticks = 400 ms
 
+    // A hurt animation within this many ticks of a big fall counts as fall damage.
+    private static final int FALL_WINDOW_TICKS = 20;
+
     private final Minecraft mc = Minecraft.getMinecraft();
     private KeyBinding toggleKey;
     private KeyBinding delayUpKey;
@@ -31,6 +34,9 @@ public class JumpReset {
     private boolean pending = false;
     private int delayLeft = 0;
     private int lastHurtTime = 0;
+
+    private int tick = 0;
+    private int bigFallTick = -1000;
 
     @Mod.EventHandler
     public void init(FMLInitializationEvent event) {
@@ -70,11 +76,18 @@ public class JumpReset {
         if (!(e.entity instanceof EntityPlayerSP)) return;
         EntityPlayerSP p = (EntityPlayerSP) e.entity;
 
+        // Remember when you were last falling far enough to take fall damage.
+        if (p.fallDistance > 3.0f) {
+            bigFallTick = tick;
+        }
+        tick++;
+
         int hurt = p.hurtTime;
 
-        // Fresh hit: arm the jump if you were on the ground and not burning.
+        // Fresh hurt animation: arm the jump only if it looks like a real hit.
         if (hurt > lastHurtTime) {
-            pending = enabled && !p.isBurning() && canJump(p);
+            boolean fromFall = (tick - bigFallTick) <= FALL_WINDOW_TICKS;
+            pending = enabled && !p.isBurning() && !fromFall && canJump(p);
             delayLeft = delayTicks;
         }
         lastHurtTime = hurt;
